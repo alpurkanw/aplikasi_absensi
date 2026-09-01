@@ -8,12 +8,15 @@ from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QLabel,
+    QHeaderView,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QDialog,
     QDialogButtonBox,
     QLineEdit,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -28,21 +31,21 @@ class CaptureWorker(QThread):
     event_received = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, agent_engine):
+    def __init__(self, agent_engine, templates=None):
         super().__init__()
         self.agent_engine = agent_engine
         self.agent = None
         self.verification = EnrollmentService()
+        self.templates = templates or {}
 
     def on_sample(self, sample):
-        for template_path in Path("templates").glob("*.fpt"):
-            if self.verification.verify_sample(template_path.read_bytes(), sample):
-                employee_id = template_path.stem
+        for employee_id, (employee_name, template_blob) in self.templates.items():
+            if self.verification.verify_sample(template_blob, sample):
                 self.agent_engine.save_log(
                     employee_id,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "U.are.U 4500",
-                    employee_id,
+                    employee_name or employee_id,
                 )
                 self.event_received.emit(f"[OK] Fingerprint matched: {employee_id}")
                 return
@@ -68,9 +71,10 @@ class EnrollmentWorker(QThread):
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, employee_id):
+    def __init__(self, employee_id, employee_name=""):
         super().__init__()
         self.employee_id = employee_id
+        self.employee_name = employee_name
         self.agent = None
         self.samples = []
         self.required = 0
@@ -95,7 +99,7 @@ class EnrollmentWorker(QThread):
             if len(self.samples) != self.required:
                 raise RuntimeError("Enrollment dihentikan sebelum semua capture selesai")
             template = service.create_template(self.samples)
-            target = service.save_template(template, self.employee_id)
+            target = service.save_template(template, self.employee_id, self.employee_name)
             self.completed.emit(str(target))
         except Exception as error:
             self.failed.emit(str(error))
@@ -111,17 +115,24 @@ class EmployeeDialog(QDialog):
         self.setWindowTitle("Register Karyawan")
         self.employee_id = QLineEdit()
         self.employee_id.setPlaceholderText("Contoh: EMP-1001")
+        self.employee_name = QLineEdit()
+        self.employee_name.setPlaceholderText("Contoh: Budi Santoso")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Masukkan NIP / nomor induk pegawai:"))
         layout.addWidget(self.employee_id)
+        layout.addWidget(QLabel("Masukkan nama karyawan:"))
+        layout.addWidget(self.employee_name)
         layout.addWidget(buttons)
 
     def accept(self):
         if not self.employee_id.text().strip():
             QMessageBox.warning(self, "NIP wajib diisi", "Masukkan NIP karyawan terlebih dahulu.")
+            return
+        if not self.employee_name.text().strip():
+            QMessageBox.warning(self, "Nama wajib diisi", "Masukkan nama karyawan terlebih dahulu.")
             return
         super().accept()
 
@@ -131,10 +142,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker = None
         self.agent_engine = AgentEngine()
+        self.templates = EnrollmentService.load_all_templates()
         self.agent_engine.start_background_sync(interval_seconds=5)
         self.setWindowTitle("Fingerprint Attendance Agent")
         self.resize(760, 520)
         self._build_ui()
+        self.refresh_summary()
 
         QShortcut(QKeySequence("Ctrl+C"), self, self.close)
 
@@ -147,12 +160,15 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Start Scan")
         self.stop_button = QPushButton("Stop Scan")
         self.register_button = QPushButton("Register Karyawan")
+        self.list_button = QPushButton("Daftar Karyawan")
         self.start_button.setObjectName("startButton")
         self.stop_button.setObjectName("stopButton")
         self.register_button.setObjectName("registerButton")
+        self.list_button.setObjectName("listButton")
         self.start_button.clicked.connect(self.start_scan)
         self.stop_button.clicked.connect(self.stop_scan)
         self.register_button.clicked.connect(self.register_employee)
+        self.list_button.clicked.connect(self.show_registered_employees)
         self.stop_button.setEnabled(False)
 
         self.log_view = QTextEdit()
@@ -169,10 +185,15 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.register_button)
+        controls.addWidget(self.list_button)
         controls.addStretch()
+
+        self.summary_label = QLabel("0 terdaftar")
+        self.summary_label.setObjectName("summaryLabel")
 
         layout = QVBoxLayout()
         layout.addLayout(header)
+        layout.addWidget(self.summary_label)
         layout.addWidget(QLabel("Live Fingerprint Transaction Log"))
         layout.addLayout(controls)
         layout.addWidget(self.log_view)
@@ -181,22 +202,40 @@ class MainWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
         self.setStyleSheet("""
-            QMainWindow { background: #f4f6f8; }
-            QLabel { color: #24313d; font-size: 14px; }
+            QMainWindow { background: #f8f9fa; }
+            QLabel { color: #212529; font-size: 14px; }
             QLabel#statusText { font-weight: 700; }
-            QLabel#statusDot { color: #d64545; font-size: 24px; }
-            QPushButton { padding: 10px 20px; font-weight: 600; }
-            QPushButton#startButton { background: #1677c8; color: white; border: 0; border-radius: 4px; }
-            QPushButton#startButton:hover { background: #0f5f9f; }
-            QPushButton#startButton:disabled { background: #9fb4c5; color: #edf3f7; }
-            QPushButton#stopButton { background: #d64545; color: white; border: 0; border-radius: 4px; }
-            QPushButton#stopButton:hover { background: #b93434; }
-            QPushButton#stopButton:disabled { background: #c9ced3; color: #70777d; }
-            QPushButton#registerButton { background: #16705a; color: white; border: 0; border-radius: 4px; }
-            QPushButton#registerButton:hover { background: #0f5947; }
-            QPushButton#registerButton:disabled { background: #b7c8c3; color: #edf3f7; }
-            QTextEdit { background: #17232d; color: #d8f3dc; font-family: Consolas; font-size: 13px; }
+            QLabel#statusDot { color: #dc3545; font-size: 24px; }
+            QLabel#summaryLabel { color: #0d6efd; font-size: 13px; font-weight: 700; }
+            QPushButton { padding: 10px 20px; font-weight: 600; border: 0; border-radius: 6px; color: white; }
+            QPushButton#startButton { background: #0d6efd; }
+            QPushButton#startButton:hover { background: #0b5ed7; }
+            QPushButton#startButton:disabled { background: #9ec5fe; color: #eef6ff; }
+            QPushButton#stopButton { background: #dc3545; }
+            QPushButton#stopButton:hover { background: #bb2d3b; }
+            QPushButton#stopButton:disabled { background: #f1aeb5; color: #fff5f5; }
+            QPushButton#registerButton { background: #198754; }
+            QPushButton#registerButton:hover { background: #157347; }
+            QPushButton#registerButton:disabled { background: #a3cfbb; color: #f0fdf4; }
+            QPushButton#listButton { background: #6f42c1; }
+            QPushButton#listButton:hover { background: #59359a; }
+            QDialog { background: #ffffff; }
+            QDialog QLabel { color: #212529; }
+            QDialog QPushButton { background: #0d6efd; }
+            QDialog QPushButton:hover { background: #0b5ed7; }
+            QLineEdit { background: #ffffff; border: 1px solid #ced4da; border-radius: 6px; padding: 8px 10px; color: #212529; }
+            QLineEdit:focus { border: 1px solid #86b7fe; }
+            QTextEdit { background: #111827; color: #e5e7eb; font-family: Consolas; font-size: 13px; border: 1px solid #374151; border-radius: 6px; }
+            QTableWidget { background: #ffffff; gridline-color: #e9ecef; color: #212529; border: 1px solid #dee2e6; border-radius: 6px; }
+            QHeaderView::section { background: #e9ecef; color: #212529; padding: 8px; border: 0; }
+            QMessageBox { background: #ffffff; }
+            QMessageBox QLabel { color: #212529; }
+            QMessageBox QPushButton { background: #0d6efd; color: white; border: 0; border-radius: 6px; }
+            QMessageBox QPushButton:hover { background: #0b5ed7; }
         """)
+
+    def refresh_summary(self):
+        self.summary_label.setText(f"{len(self.templates)} terdaftar")
 
     def append_log(self, message):
         self.log_view.append(message)
@@ -211,7 +250,7 @@ class MainWindow(QMainWindow):
         self.log_view.append("[INFO] Starting fingerprint scan...")
         self.status_text.setText("CONNECTING...")
         self.status_dot.setStyleSheet("color: #d49a27; font-size: 24px;")
-        self.worker = CaptureWorker(self.agent_engine)
+        self.worker = CaptureWorker(self.agent_engine, self.templates)
         self.worker.event_received.connect(self.append_log)
         self.worker.failed.connect(self.handle_error)
         self.worker.finished.connect(self.scan_finished)
@@ -230,15 +269,21 @@ class MainWindow(QMainWindow):
         dialog = EmployeeDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
+
         employee_id = dialog.employee_id.text().strip()
+        employee_name = dialog.employee_name.text().strip()
+        if EnrollmentService.employee_exists(employee_id):
+            QMessageBox.warning(self, "NIP sudah terdaftar", f"NIP {employee_id} sudah ada di database. Registrasi ditolak.")
+            return
+
         self.register_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.stop_button.setText("Batalkan Registrasi")
         self.status_text.setText("REGISTERING...")
         self.status_dot.setStyleSheet("color: #d49a27; font-size: 24px;")
-        self.log_view.append(f"[INFO] Registration started for {employee_id}")
-        self.worker = EnrollmentWorker(employee_id)
+        self.log_view.append(f"[INFO] Registration started for {employee_id} - {employee_name}")
+        self.worker = EnrollmentWorker(employee_id, employee_name)
         self.worker.event_received.connect(self.append_log)
         self.worker.completed.connect(self.registration_completed)
         self.worker.failed.connect(self.handle_error)
@@ -246,8 +291,68 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def registration_completed(self, target):
+        self.templates = EnrollmentService.load_all_templates()
+        self.refresh_summary()
         self.log_view.append(f"[OK] Employee mapped to template: {target}")
         QMessageBox.information(self, "Registrasi berhasil", "Template fingerprint berhasil dibuat dan disimpan.")
+
+    def show_registered_employees(self):
+        records = EnrollmentService.get_employee_records()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Daftar Karyawan Terdaftar")
+        dialog.resize(560, 360)
+
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["NIP Karyawan", "Nama Karyawan", "Tanggal Daftar"])
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        if not records:
+            table.setRowCount(1)
+            table.setItem(0, 0, QTableWidgetItem("-"))
+            table.setItem(0, 1, QTableWidgetItem("Belum ada karyawan"))
+            table.setItem(0, 2, QTableWidgetItem("-"))
+        else:
+            table.setRowCount(len(records))
+            for row_index, record in enumerate(records):
+                table.setItem(row_index, 0, QTableWidgetItem(record["employee_id"]))
+                table.setItem(row_index, 1, QTableWidgetItem(record["employee_name"]))
+                table.setItem(row_index, 2, QTableWidgetItem(record["created_at"]))
+
+        delete_button = QPushButton("Hapus Karyawan Terpilih")
+        delete_button.clicked.connect(lambda: self.delete_selected_employee(dialog, table))
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Daftar fingerprint terdaftar:"))
+        layout.addWidget(table)
+        layout.addWidget(delete_button)
+        dialog.exec()
+
+    def delete_selected_employee(self, dialog, table):
+        selected_row = table.currentRow()
+        if selected_row < 0:
+            QMessageBox.warning(self, "Tidak ada yang dipilih", "Pilih karyawan yang akan dihapus terlebih dahulu.")
+            return
+        employee_id = table.item(selected_row, 0).text().strip()
+        if not employee_id or employee_id == "-":
+            return
+        result = QMessageBox.question(
+            self,
+            "Hapus karyawan",
+            f"Yakin ingin menghapus {employee_id} dan template fingerprintnya?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+        EnrollmentService.delete_employee(employee_id)
+        self.templates = EnrollmentService.load_all_templates()
+        self.refresh_summary()
+        dialog.close()
+        QMessageBox.information(self, "Berhasil", f"Karyawan {employee_id} dan template fingerprintnya sudah dihapus.")
 
     def registration_finished(self):
         self.register_button.setEnabled(True)

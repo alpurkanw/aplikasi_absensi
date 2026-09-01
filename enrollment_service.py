@@ -56,8 +56,49 @@ mc.MC_verifyFeaturesEx.restype = ctypes.c_int
 
 
 class EnrollmentService:
+    DEFAULT_DB_PATH = "attendance_offline.db"
+
     @staticmethod
-    def init_template_db(db_path="employee_templates.db"):
+    def _resolve_db_path(db_path=None):
+        if db_path is None:
+            return EnrollmentService.DEFAULT_DB_PATH
+        return db_path
+
+    @staticmethod
+    def _migrate_legacy_templates(target_db_path=None):
+        target_db_path = EnrollmentService._resolve_db_path(target_db_path)
+        legacy_db = "employee_templates.db"
+        if not Path(legacy_db).exists() or Path(target_db_path).exists() and Path(target_db_path).stat().st_size > 0:
+            return
+
+        try:
+            with sqlite3.connect(legacy_db) as src, sqlite3.connect(target_db_path) as dst:
+                rows = src.execute(
+                    "SELECT employee_id, employee_name, template_blob, created_at FROM employee_templates"
+                ).fetchall()
+                if rows:
+                    dst.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS employee_templates (
+                            employee_id TEXT PRIMARY KEY,
+                            employee_name TEXT NOT NULL DEFAULT '',
+                            template_blob BLOB NOT NULL,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    dst.executemany(
+                        "INSERT OR REPLACE INTO employee_templates (employee_id, employee_name, template_blob, created_at) VALUES (?, ?, ?, ?)",
+                        rows,
+                    )
+                    dst.commit()
+        except sqlite3.Error:
+            pass
+
+    @staticmethod
+    def init_template_db(db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
+        EnrollmentService._migrate_legacy_templates(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
@@ -76,13 +117,30 @@ class EnrollmentService:
             conn.commit()
 
     @staticmethod
-    def save_template(template, employee_id, employee_name="", directory="templates", db_path="employee_templates.db"):
+    def employee_exists(employee_id, db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
+        employee_id = (employee_id or "").strip()
+        if not employee_id:
+            return False
+        EnrollmentService.init_template_db(db_path)
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM employee_templates WHERE employee_id = ?",
+                (employee_id,),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def save_template(template, employee_id, employee_name="", directory="templates", db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         if not template:
             raise ValueError("Template kosong")
-        path = Path(directory)
-        path.mkdir(parents=True, exist_ok=True)
-        target = path / f"{employee_id}.fpt"
-        target.write_bytes(template)
+
+        employee_id = (employee_id or "").strip()
+        if not employee_id:
+            raise ValueError("NIP karyawan wajib diisi")
+        if EnrollmentService.employee_exists(employee_id, db_path):
+            raise ValueError(f"NIP karyawan {employee_id} sudah terdaftar")
 
         EnrollmentService.init_template_db(db_path)
         with sqlite3.connect(db_path) as conn:
@@ -90,18 +148,15 @@ class EnrollmentService:
                 """
                 INSERT INTO employee_templates (employee_id, employee_name, template_blob)
                 VALUES (?, ?, ?)
-                ON CONFLICT(employee_id) DO UPDATE SET
-                    employee_name = excluded.employee_name,
-                    template_blob = excluded.template_blob,
-                    created_at = CURRENT_TIMESTAMP
                 """,
                 (employee_id, employee_name, template),
             )
             conn.commit()
-        return target
+        return employee_id
 
     @staticmethod
-    def list_registered_employees(db_path="employee_templates.db", directory="templates"):
+    def list_registered_employees(db_path=None, directory="templates"):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         EnrollmentService.init_template_db(db_path)
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
@@ -115,7 +170,8 @@ class EnrollmentService:
         return employees
 
     @staticmethod
-    def get_employee_name(employee_id, db_path="employee_templates.db"):
+    def get_employee_name(employee_id, db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         with sqlite3.connect(db_path) as conn:
             row = conn.execute(
                 "SELECT employee_name FROM employee_templates WHERE employee_id = ?",
@@ -124,7 +180,8 @@ class EnrollmentService:
         return row[0] if row and row[0] else employee_id
 
     @staticmethod
-    def get_employee_records(db_path="employee_templates.db"):
+    def get_employee_records(db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         EnrollmentService.init_template_db(db_path)
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
@@ -136,7 +193,8 @@ class EnrollmentService:
         ]
 
     @staticmethod
-    def delete_employee(employee_id, directory="templates", db_path="employee_templates.db"):
+    def delete_employee(employee_id, directory="templates", db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         EnrollmentService.init_template_db(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute("DELETE FROM employee_templates WHERE employee_id = ?", (employee_id,))
@@ -148,7 +206,8 @@ class EnrollmentService:
         return True
 
     @staticmethod
-    def load_all_templates(db_path="employee_templates.db", directory="templates"):
+    def load_all_templates(db_path=None, directory="templates"):
+        db_path = EnrollmentService._resolve_db_path(db_path)
         EnrollmentService.init_template_db(db_path)
         templates = {}
         with sqlite3.connect(db_path) as conn:
@@ -159,7 +218,7 @@ class EnrollmentService:
         for employee_id, employee_name, template_blob in rows:
             templates[employee_id] = (employee_name or employee_id, template_blob)
 
-        if not templates:
+        if not templates and Path(directory).exists():
             for template_path in Path(directory).glob("*.fpt"):
                 employee_id = template_path.stem
                 template_blob = template_path.read_bytes()
@@ -240,31 +299,6 @@ class EnrollmentService:
                 fx.FX_closeContext(fx_context)
             mc.MC_terminate()
             fx.FX_terminate()
-
-    @staticmethod
-    def save_template(template, employee_id, employee_name="", directory="templates", db_path="employee_templates.db"):
-        if not template:
-            raise ValueError("Template kosong")
-        path = Path(directory)
-        path.mkdir(parents=True, exist_ok=True)
-        target = path / f"{employee_id}.fpt"
-        target.write_bytes(template)
-
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO employee_templates (employee_id, employee_name, template_blob)
-                VALUES (?, ?, ?)
-                ON CONFLICT(employee_id) DO UPDATE SET
-                    employee_name = excluded.employee_name,
-                    template_blob = excluded.template_blob,
-                    created_at = CURRENT_TIMESTAMP
-                """,
-                (employee_id, employee_name, template),
-            )
-            conn.commit()
-        return target
 
     def verify_sample(self, template, sample):
         if not template or not sample:
