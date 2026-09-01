@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+*.db
+attendance_offline.db
+employee_templates.db
+fingerprint_sample.bin
+venv/
+.venv/
+.env
+.idea/
+.vscode/
