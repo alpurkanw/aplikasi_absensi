@@ -1,8 +1,10 @@
 import ctypes
+import base64
 import sqlite3
 from pathlib import Path
 
 from capture_agent import dpfp
+from tarik_data import delete_fingerprint_templates, fetch_employees, fetch_fingerprint_templates, upload_fingerprint_template
 
 
 FEATURE_DLL = "dpHFtrEx.dll"
@@ -56,7 +58,7 @@ mc.MC_verifyFeaturesEx.restype = ctypes.c_int
 
 
 class EnrollmentService:
-    DEFAULT_DB_PATH = "attendance_offline.db"
+    DEFAULT_DB_PATH = Path(__file__).with_name("attendance_offline.db")
 
     @staticmethod
     def _resolve_db_path(db_path=None):
@@ -65,170 +67,106 @@ class EnrollmentService:
         return db_path
 
     @staticmethod
-    def _migrate_legacy_templates(target_db_path=None):
-        target_db_path = EnrollmentService._resolve_db_path(target_db_path)
-        legacy_db = "employee_templates.db"
-        if not Path(legacy_db).exists() or Path(target_db_path).exists() and Path(target_db_path).stat().st_size > 0:
-            return
-
-        try:
-            with sqlite3.connect(legacy_db) as src, sqlite3.connect(target_db_path) as dst:
-                rows = src.execute(
-                    "SELECT employee_id, employee_name, template_blob, created_at FROM employee_templates"
-                ).fetchall()
-                if rows:
-                    dst.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS employee_templates (
-                            employee_id TEXT PRIMARY KEY,
-                            employee_name TEXT NOT NULL DEFAULT '',
-                            template_blob BLOB NOT NULL,
-                            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                        )
-                        """
-                    )
-                    dst.executemany(
-                        "INSERT OR REPLACE INTO employee_templates (employee_id, employee_name, template_blob, created_at) VALUES (?, ?, ?, ?)",
-                        rows,
-                    )
-                    dst.commit()
-        except sqlite3.Error:
-            pass
-
-    @staticmethod
-    def init_template_db(db_path=None):
-        db_path = EnrollmentService._resolve_db_path(db_path)
-        EnrollmentService._migrate_legacy_templates(db_path)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS employee_templates (
-                    employee_id TEXT PRIMARY KEY,
-                    employee_name TEXT NOT NULL DEFAULT '',
-                    template_blob BLOB NOT NULL,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-
-            columns = [row[1] for row in conn.execute("PRAGMA table_info(employee_templates)").fetchall()]
-            if "employee_name" not in columns:
-                conn.execute("ALTER TABLE employee_templates ADD COLUMN employee_name TEXT NOT NULL DEFAULT ''")
-            conn.commit()
-
-    @staticmethod
     def employee_exists(employee_id, db_path=None):
         db_path = EnrollmentService._resolve_db_path(db_path)
         employee_id = (employee_id or "").strip()
         if not employee_id:
             return False
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM employee_templates WHERE employee_id = ?",
-                (employee_id,),
-            ).fetchone()
-        return row is not None
+        return any(item["employee_code"] == employee_id for item in fetch_fingerprint_templates())
 
     @staticmethod
-    def save_template(template, employee_id, employee_name="", directory="templates", db_path=None):
-        db_path = EnrollmentService._resolve_db_path(db_path)
+    def save_template_remote(template, employee_id, finger_slot):
         if not template:
             raise ValueError("Template kosong")
-
-        employee_id = (employee_id or "").strip()
-        if not employee_id:
-            raise ValueError("NIP karyawan wajib diisi")
-        if EnrollmentService.employee_exists(employee_id, db_path):
-            raise ValueError(f"NIP karyawan {employee_id} sudah terdaftar")
-
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO employee_templates (employee_id, employee_name, template_blob)
-                VALUES (?, ?, ?)
-                """,
-                (employee_id, employee_name, template),
-            )
-            conn.commit()
+        if not 1 <= int(finger_slot) <= 3:
+            raise ValueError("Nomor sidik jari harus antara 1 dan 3")
+        upload_fingerprint_template(employee_id, int(finger_slot), template)
         return employee_id
+
+    @staticmethod
+    def migrate_local_templates_to_server(db_path=None):
+        db_path = EnrollmentService._resolve_db_path(db_path)
+        sources = []
+        for source_path in (Path(db_path), Path(db_path).with_name("employee_templates.db")):
+            if not source_path.exists():
+                continue
+            with sqlite3.connect(source_path) as conn:
+                table = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'employee_templates'"
+                ).fetchone()
+                if table:
+                    sources.extend((source_path, employee_id, template_blob) for employee_id, template_blob in conn.execute(
+                        "SELECT employee_id, template_blob FROM employee_templates ORDER BY employee_id"
+                    ).fetchall())
+
+        migrated = []
+        for source_path, employee_id, template_blob in sources:
+            try:
+                EnrollmentService.save_template_remote(template_blob, employee_id, 1)
+                migrated.append((source_path, employee_id))
+            except Exception:
+                continue
+
+        for source_path, employee_id in migrated:
+            if source_path == Path(db_path):
+                with sqlite3.connect(source_path) as conn:
+                    conn.execute("DELETE FROM employee_templates WHERE employee_id = ?", (employee_id,))
+                    conn.commit()
+
+        legacy_db = Path(db_path).with_name("employee_templates.db")
+        if legacy_db.exists():
+            with sqlite3.connect(legacy_db) as conn:
+                remaining = conn.execute("SELECT COUNT(*) FROM employee_templates").fetchone()[0]
+            if remaining == 0:
+                legacy_db.unlink()
+        return len(migrated)
 
     @staticmethod
     def list_registered_employees(db_path=None, directory="templates"):
         db_path = EnrollmentService._resolve_db_path(db_path)
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                "SELECT employee_id, created_at FROM employee_templates ORDER BY employee_id"
-            ).fetchall()
-
-        employees = [row[0] for row in rows]
-        if not employees:
-            for template_path in Path(directory).glob("*.fpt"):
-                employees.append(template_path.stem)
-        return employees
+        return sorted({item["employee_code"] for item in fetch_fingerprint_templates()})
 
     @staticmethod
     def get_employee_name(employee_id, db_path=None):
         db_path = EnrollmentService._resolve_db_path(db_path)
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT employee_name FROM employee_templates WHERE employee_id = ?",
-                (employee_id,),
-            ).fetchone()
-        return row[0] if row and row[0] else employee_id
+        for item in fetch_fingerprint_templates():
+            if item["employee_code"] == employee_id:
+                return item.get("employee_name") or employee_id
+        return employee_id
 
     @staticmethod
     def get_employee_records(db_path=None):
-        db_path = EnrollmentService._resolve_db_path(db_path)
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                "SELECT employee_id, employee_name, created_at FROM employee_templates ORDER BY employee_id"
-            ).fetchall()
-        return [
-            {"employee_id": employee_id, "employee_name": employee_name or employee_id, "created_at": created_at}
-            for employee_id, employee_name, created_at in rows
-        ]
+        templates_by_employee = {}
+        for item in fetch_fingerprint_templates():
+            templates_by_employee.setdefault(item["employee_code"], []).append(item)
+
+        records = []
+        for employee in fetch_employees():
+            employee_id = employee["employee_code"]
+            employee_templates = templates_by_employee.get(employee_id, [])
+            records.append({
+                "employee_id": employee_id,
+                "employee_name": employee.get("name") or employee_id,
+                "created_at": employee.get("updated_at") or "SERVER",
+                "finger_count": len(employee_templates),
+                "finger_slots": [item["finger_slot"] for item in employee_templates],
+            })
+        return records
 
     @staticmethod
     def delete_employee(employee_id, directory="templates", db_path=None):
-        db_path = EnrollmentService._resolve_db_path(db_path)
-        EnrollmentService.init_template_db(db_path)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("DELETE FROM employee_templates WHERE employee_id = ?", (employee_id,))
-            conn.commit()
-
-        template_file = Path(directory) / f"{employee_id}.fpt"
-        if template_file.exists():
-            template_file.unlink()
+        delete_fingerprint_templates(employee_id)
         return True
 
     @staticmethod
     def load_all_templates(db_path=None, directory="templates"):
-        db_path = EnrollmentService._resolve_db_path(db_path)
-        EnrollmentService.init_template_db(db_path)
+        EnrollmentService.migrate_local_templates_to_server(db_path)
         templates = {}
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                "SELECT employee_id, employee_name, template_blob FROM employee_templates ORDER BY employee_id"
-            ).fetchall()
-
-        for employee_id, employee_name, template_blob in rows:
-            templates[employee_id] = (employee_name or employee_id, template_blob)
-
-        if not templates and Path(directory).exists():
-            for template_path in Path(directory).glob("*.fpt"):
-                employee_id = template_path.stem
-                template_blob = template_path.read_bytes()
-                templates[employee_id] = (employee_id, template_blob)
-                with sqlite3.connect(db_path) as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO employee_templates (employee_id, employee_name, template_blob) VALUES (?, ?, ?)",
-                        (employee_id, employee_id, template_blob),
-                    )
-                    conn.commit()
+        for item in fetch_fingerprint_templates():
+            employee_id = item["employee_code"]
+            templates.setdefault(employee_id, []).append(
+                (item.get("employee_name") or employee_id, base64.b64decode(item["template_base64"]))
+            )
         return templates
 
     def required_samples(self):

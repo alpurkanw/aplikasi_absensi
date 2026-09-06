@@ -12,3 +12,5 @@ venv/
 .env
 .idea/
 .vscode/
+config.json
+config_client.json

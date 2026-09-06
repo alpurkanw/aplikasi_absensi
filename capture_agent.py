@@ -125,8 +125,8 @@ dpfp.DPFPDestroyAcquisition.restype = ctypes.c_long
 
 
 class FingerprintCaptureAgent:
-    def __init__(self, output_file=OUTPUT_FILE, on_event=None, on_sample=None, sample_type=DP_SAMPLE_TYPE_IMAGE):
-        self.output_file = Path(output_file)
+    def __init__(self, output_file=None, on_event=None, on_sample=None, sample_type=DP_SAMPLE_TYPE_IMAGE):
+        self.output_file = Path(output_file) if output_file else None
         self.on_event = on_event
         self.on_sample = on_sample
         self.sample_type = sample_type
@@ -161,9 +161,11 @@ class FingerprintCaptureAgent:
             sample = ctypes.string_at(blob.pbData, blob.cbData)
             if self.on_sample:
                 self.on_sample(sample)
-            self.output_file.write_bytes(sample)
+            if self.output_file:
+                self.output_file.write_bytes(sample)
             self._emit(f"[OK] Fingerprint captured: {len(sample)} bytes")
-            self._emit(f"[OK] Saved: {self.output_file}")
+            if self.output_file:
+                self._emit(f"[OK] Saved: {self.output_file}")
             self._emit("[INFO] Ready for the next finger...")
             self._last_touch_event = None
             self._last_touch_ts = 0.0
@@ -182,13 +184,13 @@ class FingerprintCaptureAgent:
             if event == WN_FINGER_TOUCHED:
                 self._touch_count += 1
                 self._finger_down_at = current_ts
-                self._emit(f"[INFO] Finger touched (count: {self._touch_count}) - tahan stabil di sensor")
+                self._emit("[INFO] Finger touched - tahan stabil di sensor")
             else:
                 self._remove_count += 1
                 if self._finger_down_at > 0:
                     hold_time = current_ts - self._finger_down_at
-                    self._emit(f"[INFO] Finger removed (count: {self._remove_count}) - hold time: {hold_time:.1f}s")
-                self._emit(f"[INFO] Finger removed (count: {self._remove_count})")
+                    self._emit(f"[INFO] Finger removed - hold time: {hold_time:.1f}s")
+                self._emit("[INFO] Finger removed")
         elif event == WN_DISCONNECT:
             self._emit("[ERROR] Fingerprint reader disconnected")
         elif event == WN_RECONNECT:
