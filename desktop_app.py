@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal, Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -207,6 +207,7 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("Log transaksi fingerprint akan tampil di sini...")
+        self.log_view.document().setMaximumBlockCount(200)
 
         self.warning_label = QLabel()
         self.warning_label.setWordWrap(True)
@@ -298,7 +299,10 @@ class MainWindow(QMainWindow):
         self.pending_label.setText(f"{pending_count} log belum terkirim")
 
     def append_log(self, message):
-        self.log_view.append(message)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.log_view.append(f"[{timestamp}] {message}")
+        self.log_view.moveCursor(QTextCursor.End)
+        self.log_view.ensureCursorVisible()
         if message.startswith("[WARN] Fingerprint tidak cocok"):
             self.warning_label.setText(
                 "SIDIK JARI TIDAK DIKENAL\n"
@@ -329,7 +333,7 @@ class MainWindow(QMainWindow):
         )
 
     def start_scan(self):
-        self.log_view.append("[INFO] Starting fingerprint scan...")
+        self.append_log("[INFO] Starting fingerprint scan...")
         self.warning_label.clear()
         self.warning_label.hide()
         self.status_text.setText("CONNECTING...")
@@ -389,7 +393,7 @@ class MainWindow(QMainWindow):
             self.worker.stop_enrollment()
         elif self.worker and hasattr(self.worker, "stop_capture"):
             self.worker.stop_capture()
-        self.log_view.append("[INFO] Stopping fingerprint scan...")
+        self.append_log("[INFO] Stopping fingerprint scan...")
 
     def register_employee(self):
         dialog = EmployeeDialog(self)
@@ -407,7 +411,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setText("Batalkan Registrasi")
         self.status_text.setText("REGISTERING...")
         self.status_dot.setStyleSheet("color: #d49a27; font-size: 24px;")
-        self.log_view.append(f"[INFO] Registration started for {employee_id} - {employee_name}")
+        self.append_log(f"[INFO] Registration started for {employee_id} - {employee_name}")
         self.worker = EnrollmentWorker(employee_id, employee_name, finger_slot)
         self.worker.event_received.connect(self.append_log)
         self.worker.completed.connect(self.registration_completed)
@@ -418,7 +422,7 @@ class MainWindow(QMainWindow):
     def registration_completed(self, target):
         self.templates = EnrollmentService.load_all_templates()
         self.refresh_summary()
-        self.log_view.append(f"[OK] Employee mapped to template: {target}")
+        self.append_log(f"[OK] Employee mapped to template: {target}")
         QMessageBox.information(self, "Registrasi berhasil", "Template fingerprint berhasil dibuat dan disimpan.")
 
     def show_registered_employees(self):

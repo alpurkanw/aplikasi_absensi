@@ -7,13 +7,9 @@ from pathlib import Path
 SDK_DLL = "DPFPApi.dll"
 OUTPUT_FILE = Path(__file__).with_name("fingerprint_sample.bin")
 DP_SAMPLE_TYPE_IMAGE = 4
-DP_SAMPLE_TYPE_RAW = 0
-
-# KRUSIAL: Prioritas 0 (DP_PRIORITY_HIGH) memungkinkan pembacaan sidik jari
-# meskipun aplikasi tidak aktif (Unfocused / Running in Background)
-DP_PRIORITY_HIGH = 0
+DP_SAMPLE_TYPE_RAW = 0  # Alternative: raw sensor data
 DP_PRIORITY_NORMAL = 2
-
+DP_PRIORITY_HIGH = 0    # Alternative: high priority
 WN_COMPLETED = 0
 WN_ERROR = 1
 WN_DISCONNECT = 2
@@ -23,9 +19,10 @@ WN_FINGER_GONE = 6
 WM_APP = 0x8000
 WM_FP_NOTIFY = WM_APP + 1
 WM_QUIT = 0x0012
-
-# HWND_MESSAGE (-3) membuat window murni di memory background
 HWND_MESSAGE = wintypes.HWND(-3)
+WS_OVERLAPPEDWINDOW = 0x00CF0000
+WS_VISIBLE = 0x10000000
+SW_SHOW = 5
 
 
 class DataBlob(ctypes.Structure):
@@ -97,14 +94,20 @@ user32.CreateWindowExW.argtypes = [
 user32.CreateWindowExW.restype = wintypes.HWND
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 user32.DestroyWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UpdateWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
 user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+# DPFPApi uses HRESULT for API functions.
 dpfp.DPFPInit.restype = ctypes.c_long
 dpfp.DPFPTerm.restype = None
 dpfp.DPFPCreateAcquisition.argtypes = [
@@ -138,6 +141,12 @@ class FingerprintCaptureAgent:
         self.wnd_proc = WNDPROC(self._window_proc)
         self._last_touch_event = None
         self._last_touch_ts = 0.0
+        self._finger_down_at = 0.0
+        self._capture_started_at = 0.0
+        self._capture_timeout_seconds = 30  # 30 seconds for sensor to process
+        self._min_hold_time = 0.5  # finger must stay down for at least 0.5s to capture
+        self._touch_count = 0
+        self._remove_count = 0
 
     def _window_proc(self, hwnd, message, wparam, lparam):
         if message == WM_QUIT:
@@ -167,6 +176,8 @@ class FingerprintCaptureAgent:
             self._emit("[INFO] Ready for the next finger...")
             self._last_touch_event = None
             self._last_touch_ts = 0.0
+            self._finger_down_at = 0.0
+            self._capture_started_at = 0.0
         elif event == WN_ERROR:
             self._emit(f"[ERROR] SDK capture error: 0x{value & 0xFFFFFFFF:08X}")
             self._stop_and_close()
@@ -178,8 +189,14 @@ class FingerprintCaptureAgent:
             self._last_touch_event = event
             self._last_touch_ts = current_ts
             if event == WN_FINGER_TOUCHED:
+                self._touch_count += 1
+                self._finger_down_at = current_ts
                 self._emit("[INFO] Finger touched - tahan stabil di sensor")
             else:
+                self._remove_count += 1
+                if self._finger_down_at > 0:
+                    hold_time = current_ts - self._finger_down_at
+                    self._emit(f"[INFO] Finger removed - hold time: {hold_time:.1f}s")
                 self._emit("[INFO] Finger removed")
         elif event == WN_DISCONNECT:
             self._emit("[ERROR] Fingerprint reader disconnected")
@@ -200,7 +217,7 @@ class FingerprintCaptureAgent:
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
         user32.PeekMessageW(ctypes.byref(wintypes.MSG()), None, 0, 0, 0)
-
+        self._capture_started_at = time.time()
         result = dpfp.DPFPInit()
         if result not in (0, 1):
             raise RuntimeError(f"DPFPInit failed: 0x{result & 0xFFFFFFFF:08X}")
@@ -214,7 +231,6 @@ class FingerprintCaptureAgent:
                 error = ctypes.get_last_error()
                 raise ctypes.WinError(error)
 
-            # Buat Message-Only Window (HWND_MESSAGE) agar bisa menerima event di background
             self.window = user32.CreateWindowExW(
                 0,
                 self.class_name,
@@ -224,7 +240,7 @@ class FingerprintCaptureAgent:
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                None,
                 None,
                 wnd_class.hInstance,
                 None,
@@ -233,11 +249,9 @@ class FingerprintCaptureAgent:
                 raise ctypes.WinError(ctypes.get_last_error())
 
             null_guid = Guid()
-            self._emit(f"[INFO] Initializing DPFP background acquisition (Priority: HIGH)")
-
-            # PENTING: Menggunakan DP_PRIORITY_HIGH agar SDK tetap merespons saat window tidak aktif
+            self._emit(f"[DEBUG] Initializing DPFP acquisition: priority={DP_PRIORITY_NORMAL}, sample_type={self.sample_type}")
             result = dpfp.DPFPCreateAcquisition(
-                DP_PRIORITY_HIGH,
+                DP_PRIORITY_NORMAL,
                 ctypes.byref(null_guid),
                 self.sample_type,
                 self.window,
@@ -251,10 +265,21 @@ class FingerprintCaptureAgent:
             if result != 0:
                 raise RuntimeError(f"DPFPStartAcquisition failed: 0x{result & 0xFFFFFFFF:08X}")
 
-            self._emit("Fingerprint reader ready (Background Mode Active). Tempelkan jari pada reader...")
-
+            self._emit("Fingerprint reader ready. Tempelkan jari pada reader...")
+            self._emit("[HINT] Tahan jari stabil di sensor selama minimal 1-2 detik tanpa gerak")
             message = wintypes.MSG()
             while not self._stop_requested and user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                if self._capture_started_at and (time.time() - self._capture_started_at) > self._capture_timeout_seconds:
+                    self._emit(f"\n[DIAGNOSTIC] Timeout setelah {self._capture_timeout_seconds}s")
+                    self._emit(f"[DIAGNOSTIC] Events detected: {self._touch_count} touches, {self._remove_count} removes")
+                    self._emit("[DIAGNOSTIC] Sensor merespons tapi tidak mengeluarkan sample yang valid")
+                    self._emit("[DIAGNOSTIC] Kemungkinan penyebab:")
+                    self._emit("  1. Jari tidak cukup lama menempel (coba tahan 2-3 detik)")
+                    self._emit("  2. Tekanan jari tidak konsisten (tahan dengan tekanan stabil)")
+                    self._emit("  3. Sensor memerlukan pembersihan")
+                    self._stop_and_close()
+                    user32.PostQuitMessage(1)
+                    break
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
         finally:

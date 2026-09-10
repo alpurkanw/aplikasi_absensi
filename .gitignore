@@ -12,5 +12,6 @@ venv/
 .env
 .idea/
 .vscode/
+build_windows/
 config.json
 config_client.json
